@@ -16,7 +16,12 @@
 
 ## 下载即用(Windows 10/11 x64)
 
-从 [**Releases**](https://github.com/YSKM523/fastrans/releases/latest) 下载 zip,解压,双击 `fastrans.exe`——模型已含在包内,无需安装任何东西。
+去 [**Releases**](https://github.com/YSKM523/fastrans/releases/latest) 下载:
+
+- **`fastrans-vX.Y.Z-setup.exe`(推荐)**——双击安装,中文向导,免管理员权限,可选开机自启,系统应用列表里可卸载
+- **`fastrans-vX.Y.Z-windows-x64.zip`(绿色版)**——解压双击 `fastrans.exe` 即用
+
+模型已含在包内,无需再装任何东西;之后有新版会静默自动更新。
 
 > 首次运行若弹出 "Windows 已保护你的电脑"(SmartScreen):点 **更多信息 → 仍要运行**。这是未签名新程序的例行提示;本程序完全离线、源码公开,介意的话可对照 Release 页的 SHA256 校验,或直接从源码编译。
 

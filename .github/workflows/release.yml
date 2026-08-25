@@ -40,12 +40,20 @@ jobs:
           $out = [IO.File]::Create("fastrans.exe.gz")
           $gzs = New-Object IO.Compression.GzipStream($out, [IO.Compression.CompressionLevel]::Optimal)
           $in.CopyTo($gzs); $gzs.Dispose(); $out.Dispose(); $in.Dispose()
+          # Installer (Inno Setup is preinstalled on windows-latest).
+          $ver = $tag.TrimStart('v')
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /Q "/DMyAppVersion=$ver" installer\setup.iss
+          Move-Item "installer\Output\fastrans-v$ver-setup.exe" .
+          $setup = "fastrans-v$ver-setup.exe"
           $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash
           $hashGz = (Get-FileHash "fastrans.exe.gz" -Algorithm SHA256).Hash
-          "SHA256($stage.zip) = $hash" | Out-File checksums.txt -Encoding ascii
+          $hashSetup = (Get-FileHash $setup -Algorithm SHA256).Hash
+          "SHA256($setup) = $hashSetup" | Out-File checksums.txt -Encoding ascii
+          "SHA256($stage.zip) = $hash" | Out-File checksums.txt -Append -Encoding ascii
           "SHA256(fastrans.exe.gz) = $hashGz" | Out-File checksums.txt -Append -Encoding ascii
           Get-Content checksums.txt
           "ZIP_NAME=$stage.zip" | Out-File $env:GITHUB_ENV -Append -Encoding ascii
+          "SETUP_NAME=$setup" | Out-File $env:GITHUB_ENV -Append -Encoding ascii
 
       - name: Upload artifact (manual runs)
         if: github.ref_type != 'tag'
@@ -53,6 +61,7 @@ jobs:
         with:
           name: ${{ env.ZIP_NAME }}
           path: |
+            ${{ env.SETUP_NAME }}
             ${{ env.ZIP_NAME }}
             fastrans.exe.gz
             checksums.txt
@@ -65,7 +74,11 @@ jobs:
         run: |
           $tag = '${{ github.ref_name }}'
           $body = @(
-            '一键包:下载 zip 解压,双击 fastrans.exe 即用(Windows 10/11 x64,无需安装任何依赖,完全离线)。',
+            "**安装包(推荐)**:下载 ``$env:SETUP_NAME`` 双击安装(中文向导,免管理员权限,可选开机自启,系统应用列表可卸载)。",
+            '',
+            "**绿色版**:下载 ``$env:ZIP_NAME`` 解压,双击 fastrans.exe 即用。",
+            '',
+            '两者均为 Windows 10/11 x64、完全离线、内置静默自动更新。首次运行若弹 SmartScreen,点"更多信息 -> 仍要运行"。',
             '',
             '校验:',
             '```',
@@ -75,4 +88,4 @@ jobs:
             '变更记录见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)。'
           ) -join "`n"
           $body | Out-File release-notes.md -Encoding utf8
-          gh release create $tag $env:ZIP_NAME fastrans.exe.gz checksums.txt --title $tag --notes-file release-notes.md
+          gh release create $tag $env:SETUP_NAME $env:ZIP_NAME fastrans.exe.gz checksums.txt --title $tag --notes-file release-notes.md

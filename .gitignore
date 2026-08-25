@@ -4,3 +4,4 @@ err*.txt
 out*.txt
 /target-dnnl
 STATUS.md
+/installer/Output
