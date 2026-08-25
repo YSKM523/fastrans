@@ -53,7 +53,25 @@ pub struct PinyinDict {
     words: HashMap<u128, Vec<(&'static str, f64)>>,
     /// Every syllable-prefix of every word key (including full keys).
     key_prefixes: HashSet<u128>,
+    /// 简拼: packed first-letter key ("hl" for hui'lai) -> top words.
+    /// Typing just the initials surfaces the word, like Microsoft Pinyin.
+    abbrev: HashMap<u64, Vec<(&'static str, f64)>>,
     max_syllable_len: usize,
+}
+
+/// Packs 2..=8 lowercase letters into a u64 jianpin key.
+fn pack_initials(letters: &[u8]) -> Option<u64> {
+    if !(2..=8).contains(&letters.len()) {
+        return None;
+    }
+    let mut key = 0u64;
+    for &b in letters {
+        if !b.is_ascii_lowercase() {
+            return None;
+        }
+        key = (key << 5) | (b - b'a' + 1) as u64;
+    }
+    Some(key)
 }
 
 /// One selectable candidate: `text` replaces the first `consumed_bytes` of the
@@ -92,6 +110,7 @@ impl PinyinDict {
             })
         };
 
+        let mut abbrev: HashMap<u64, Vec<(&'static str, f64)>> = HashMap::with_capacity(20_000);
         for line in DICT.lines() {
             let mut it = line.split('\t');
             let (Some(word), Some(freq), Some(syls)) = (it.next(), it.next(), it.next()) else {
@@ -104,15 +123,22 @@ impl PinyinDict {
             total += freq;
             let mut key = 0u128;
             let mut n = 0;
+            let mut initials = [0u8; 8];
             for s in syls.split('\'') {
                 key = pack(key, intern(s, &mut syl_text));
                 key_prefixes.insert(key);
+                if n < 8 {
+                    initials[n] = s.as_bytes().first().copied().unwrap_or(0);
+                }
                 n += 1;
             }
             if n == 0 || n > MAX_WORD_SYLS {
                 continue;
             }
             words.entry(key).or_default().push((word, freq.ln()));
+            if let Some(jp) = pack_initials(&initials[..n]) {
+                abbrev.entry(jp).or_default().push((word, freq.ln()));
+            }
         }
         // Normalize to log-probabilities: every token then scores negative, so
         // the Viterbi path prefers fewer/longer words ("今天" over "进"+"天").
@@ -123,12 +149,20 @@ impl PinyinDict {
             }
             v.sort_by(|a, b| b.1.total_cmp(&a.1));
         }
+        for v in abbrev.values_mut() {
+            for (_, s) in v.iter_mut() {
+                *s -= ln_total;
+            }
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
+            v.truncate(12);
+        }
         let max_syllable_len = syl_text.iter().map(|s| s.len()).max().unwrap_or(6);
         Self {
             syl_text,
             syl_ids,
             words,
             key_prefixes,
+            abbrev,
             max_syllable_len,
         }
     }
@@ -354,6 +388,41 @@ impl PinyinDict {
                 }
             }
         }
+
+        // 简拼 (abbreviated pinyin), like Microsoft Pinyin: the run's letters
+        // taken as per-syllable initials — "hl" -> 回来, "dw" -> 等我. When
+        // the run doesn't parse as full pinyin these are the primary
+        // candidates and drive the preview; otherwise they trail the list.
+        if !lower.contains('\'') {
+            let mut jianpin: Vec<Candidate> = Vec::new();
+            if let Some(ws) = pack_initials(lower.as_bytes()).and_then(|jp| self.abbrev.get(&jp)) {
+                let mut ws: Vec<(&str, f64)> = ws
+                    .iter()
+                    .map(|&(w, g)| (w, g + user_boost(user, w)))
+                    .collect();
+                ws.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for (w, _) in ws.into_iter().take(8) {
+                    if !candidates.iter().any(|c| c.text.as_str() == w) {
+                        jianpin.push(Candidate {
+                            text: w.to_string(),
+                            consumed_bytes: lower.len(),
+                        });
+                    }
+                }
+            }
+            if !jianpin.is_empty() {
+                if full_end == 0 {
+                    candidates.extend(jianpin);
+                    if let Some(c) = candidates.iter().find(|c| c.consumed_bytes == lower.len()) {
+                        best_line = c.text.clone();
+                    }
+                } else {
+                    let keep = MAX_CANDIDATES - jianpin.len().min(5);
+                    candidates.truncate(keep);
+                    candidates.extend(jianpin.into_iter().take(5));
+                }
+            }
+        }
         Analysis {
             candidates,
             best_line,
@@ -435,6 +504,31 @@ mod tests {
             let a = dict.analyze(input, &user);
             assert_eq!(a.best_line, expect, "input {input}");
         }
+    }
+
+    #[test]
+    fn jianpin_abbreviations() {
+        let dict = PinyinDict::load();
+        let user = UserDict::default();
+        for (jp, expect) in [("hl", "回来"), ("dw", "等我"), ("bj", "北京"), ("zmb", "怎么办")] {
+            let a = dict.analyze(jp, &user);
+            assert!(
+                a.candidates.iter().any(|c| c.text == expect),
+                "{jp}: {expect} not in {:?}",
+                a.candidates.iter().take(8).map(|c| &c.text).collect::<Vec<_>>()
+            );
+            // Pure jianpin drives the whole-line preview to a real word.
+            assert!(!a.best_line.contains(|c: char| c.is_ascii_alphabetic()), "{jp} -> {}", a.best_line);
+        }
+        // Memory personalizes jianpin exactly like full pinyin.
+        let mut user = UserDict::default();
+        user.record_pick("hl", "回来", None);
+        let a = dict.analyze("hl", &user);
+        assert_eq!(a.candidates[0].text, "回来");
+        assert_eq!(a.best_line, "回来");
+        // Full-pinyin runs keep their normal candidates first.
+        let a = dict.analyze("nihao", &UserDict::default());
+        assert_eq!(a.candidates[0].text, "你好");
     }
 
     #[test]
