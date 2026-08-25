@@ -17,6 +17,8 @@
 
 从 [**Releases**](https://github.com/YSKM523/fastrans/releases/latest) 下载 zip,解压,双击 `fastrans.exe`——模型已含在包内,无需安装任何东西。
 
+> 首次运行若弹出 "Windows 已保护你的电脑"(SmartScreen):点 **更多信息 → 仍要运行**。这是未签名新程序的例行提示;本程序完全离线、源码公开,介意的话可对照 Release 页的 SHA256 校验,或直接从源码编译。
+
 ## 从源码构建
 
 需要 [Rust](https://rustup.rs/)(≥1.95)和 [CMake](https://cmake.org/download/):
