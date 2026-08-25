@@ -1,0 +1,37 @@
+[package]
+name = "fastrans"
+version = "0.1.0"
+edition = "2021"
+authors = ["YSKM523"]
+license = "MIT"
+repository = "https://github.com/YSKM523/fastrans"
+description = "Type Chinese, commit English. A tiny offline local translation input bar."
+
+[dependencies]
+anyhow = "1"
+eframe = "0.36"
+global-hotkey = "0.8"
+arboard = "3.6"
+enigo = "0.6"
+ct2rs = { version = "0.10", features = ["sentencepiece"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[features]
+# oneDNN int8 backend: ~6x faster than ct2rs's default ruy on x86
+# (benchmarked on i5-12600K: long sentence 632ms -> 99ms).
+default = ["dnnl"]
+dnnl = ["ct2rs/dnnl"]
+
+[[bin]]
+name = "fastrans"
+path = "src/main.rs"
+
+[[bin]]
+name = "fastrans-cli"
+path = "src/bin/cli.rs"
+
+[profile.release]
+lto = "thin"
+strip = true

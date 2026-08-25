@@ -1,0 +1,4 @@
+# CTranslate2 (via ct2rs) is built with the static MSVC CRT (/MT); Rust must
+# match or the link fails with LNK2038 RuntimeLibrary mismatch.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

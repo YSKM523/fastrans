@@ -1,0 +1,6 @@
+﻿/target
+
+err*.txt
+out*.txt
+/target-dnnl
+STATUS.md

@@ -1,0 +1,370 @@
+//! Built-in pinyin -> Chinese conversion, for machines without a Chinese IME.
+//!
+//! When the input bar's text ends in a run of ASCII letters, the app treats it
+//! as pinyin: candidates appear under the input, digits 1-9 pick one, space
+//! picks the first, and Enter auto-converts the rest via the best path.
+//!
+//! Conversion is a single joint Viterbi over byte positions: word edges are
+//! found by walking syllable decompositions (so "keneng" considers both
+//! ke'neng -> 可能 and ken'eng, and the dictionary score decides). Syllables
+//! are interned to integer IDs and word keys are packed into a u128, so the
+//! hot path builds no strings until the final output.
+//!
+//! Dictionary: AOSP PinyinIME rawdict (Apache 2.0), 65k entries with
+//! frequencies, preprocessed into assets/pinyin_dict.txt as
+//! `word\tfreq\tsyl1'syl2`.
+
+use std::collections::{HashMap, HashSet};
+
+const DICT: &str = include_str!("../assets/pinyin_dict.txt");
+/// Longest word (in syllables) we look up.
+const MAX_WORD_SYLS: usize = 8;
+/// Bits per syllable id in a packed key (416 syllables < 512).
+const SYL_BITS: u32 = 9;
+/// Score for a syllable that matches no dictionary word (emitted as letters).
+const UNKNOWN_PENALTY: f64 = -30.0;
+/// Runs longer than this are not analyzed (pasted ASCII blobs).
+const MAX_RUN_BYTES: usize = 64;
+
+pub struct PinyinDict {
+    /// Interned syllable spellings, id = index + 1 (0 is reserved).
+    syl_text: Vec<&'static str>,
+    /// spelling -> id.
+    syl_ids: HashMap<&'static str, u16>,
+    /// packed syllable-id key -> (word, ln(p)) sorted by descending score.
+    words: HashMap<u128, Vec<(&'static str, f64)>>,
+    /// Every syllable-prefix of every word key (including full keys).
+    key_prefixes: HashSet<u128>,
+    max_syllable_len: usize,
+}
+
+/// One selectable candidate: `text` replaces the first `consumed_bytes` of the
+/// pinyin run.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub text: String,
+    pub consumed_bytes: usize,
+}
+
+/// The result of analyzing a pinyin run.
+#[derive(Debug, Default)]
+pub struct Analysis {
+    pub candidates: Vec<Candidate>,
+    /// Whole-run conversion: best path over convertible prefix + leftover
+    /// letters.
+    pub best_line: String,
+}
+
+fn pack(key: u128, syl_id: u16) -> u128 {
+    (key << SYL_BITS) | syl_id as u128
+}
+
+impl PinyinDict {
+    pub fn load() -> Self {
+        let mut syl_text: Vec<&'static str> = Vec::with_capacity(512);
+        let mut syl_ids: HashMap<&'static str, u16> = HashMap::with_capacity(512);
+        let mut words: HashMap<u128, Vec<(&'static str, f64)>> = HashMap::with_capacity(50_000);
+        let mut key_prefixes: HashSet<u128> = HashSet::with_capacity(80_000);
+        let mut total = 0.0_f64;
+
+        let mut intern = |s: &'static str, syl_text: &mut Vec<&'static str>| -> u16 {
+            *syl_ids.entry(s).or_insert_with(|| {
+                syl_text.push(s);
+                syl_text.len() as u16
+            })
+        };
+
+        for line in DICT.lines() {
+            let mut it = line.split('\t');
+            let (Some(word), Some(freq), Some(syls)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let Ok(freq) = freq.parse::<f64>() else {
+                continue;
+            };
+            let freq = freq.max(f64::MIN_POSITIVE);
+            total += freq;
+            let mut key = 0u128;
+            let mut n = 0;
+            for s in syls.split('\'') {
+                key = pack(key, intern(s, &mut syl_text));
+                key_prefixes.insert(key);
+                n += 1;
+            }
+            if n == 0 || n > MAX_WORD_SYLS {
+                continue;
+            }
+            words.entry(key).or_default().push((word, freq.ln()));
+        }
+        // Normalize to log-probabilities: every token then scores negative, so
+        // the Viterbi path prefers fewer/longer words ("今天" over "进"+"天").
+        let ln_total = total.ln();
+        for v in words.values_mut() {
+            for (_, s) in v.iter_mut() {
+                *s -= ln_total;
+            }
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        }
+        let max_syllable_len = syl_text.iter().map(|s| s.len()).max().unwrap_or(6);
+        Self {
+            syl_text,
+            syl_ids,
+            words,
+            key_prefixes,
+            max_syllable_len,
+        }
+    }
+
+    /// Word edges starting at byte `j`: every (end_byte, key) whose syllable
+    /// join is a dictionary key or key prefix, found by bounded DFS over
+    /// syllable decompositions. Calls `emit(end_byte, key, is_word)`.
+    fn walk_words(&self, run: &[u8], j: usize, mut emit: impl FnMut(usize, u128)) {
+        // Iterative DFS stack: (byte_pos, key, depth).
+        let mut stack: Vec<(usize, u128, usize)> = vec![(j, 0, 0)];
+        while let Some((pos, key, depth)) = stack.pop() {
+            if depth >= MAX_WORD_SYLS {
+                continue;
+            }
+            let start = if depth > 0 && pos < run.len() && run[pos] == b'\'' {
+                pos + 1
+            } else {
+                pos
+            };
+            let max_end = (start + self.max_syllable_len).min(run.len());
+            for end in (start + 1)..=max_end {
+                let piece = &run[start..end];
+                if piece.contains(&b'\'') {
+                    break;
+                }
+                // run is validated ASCII, so this is always valid UTF-8.
+                let piece = std::str::from_utf8(piece).unwrap();
+                let Some(&id) = self.syl_ids.get(piece) else {
+                    continue;
+                };
+                let key = pack(key, id);
+                if !self.key_prefixes.contains(&key) {
+                    continue;
+                }
+                if self.words.contains_key(&key) {
+                    emit(end, key);
+                }
+                stack.push((end, key, depth + 1));
+            }
+        }
+    }
+
+    /// Single syllables at byte `j` (for the unknown-word fallback).
+    fn syllables_at(&self, run: &[u8], j: usize) -> Vec<usize> {
+        let mut ends = Vec::new();
+        let max_end = (j + self.max_syllable_len).min(run.len());
+        for end in (j + 1)..=max_end {
+            let piece = &run[j..end];
+            if piece.contains(&b'\'') {
+                break;
+            }
+            if self.syl_ids.contains_key(std::str::from_utf8(piece).unwrap()) {
+                ends.push(end);
+            }
+        }
+        ends
+    }
+
+    /// Analyzes a pinyin run: candidate list + whole-run best conversion.
+    /// Non-pinyin input (non-ASCII, too long) returns the run unchanged.
+    pub fn analyze(&self, run: &str) -> Analysis {
+        if run.len() > MAX_RUN_BYTES
+            || !run.bytes().all(|b| b.is_ascii_alphabetic() || b == b'\'')
+        {
+            return Analysis {
+                candidates: Vec::new(),
+                best_line: run.to_string(),
+            };
+        }
+        let lower = run.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let n = bytes.len();
+
+        // Joint Viterbi over byte positions. dp[i] = best (score, prev, word).
+        #[derive(Clone)]
+        struct State {
+            score: f64,
+            prev: usize,
+            word: &'static str,
+            /// Fallback: emit these bytes as-is (unknown syllable).
+            raw: Option<(usize, usize)>,
+        }
+        let mut dp: Vec<Option<State>> = vec![None; n + 1];
+        dp[0] = Some(State {
+            score: 0.0,
+            prev: 0,
+            word: "",
+            raw: None,
+        });
+        for j in 0..n {
+            let Some(base) = dp[j].clone() else { continue };
+            if bytes[j] == b'\'' {
+                let cand = State {
+                    score: base.score,
+                    prev: j,
+                    word: "",
+                    raw: None,
+                };
+                if dp[j + 1].as_ref().is_none_or(|s| cand.score > s.score) {
+                    dp[j + 1] = Some(cand);
+                }
+                continue;
+            }
+            self.walk_words(bytes, j, |end, key| {
+                let (word, gain) = self.words[&key][0];
+                let score = base.score + gain;
+                if dp[end].as_ref().is_none_or(|s| score > s.score) {
+                    dp[end] = Some(State {
+                        score,
+                        prev: j,
+                        word,
+                        raw: None,
+                    });
+                }
+            });
+            // Unknown fallback: a valid syllable with no word entry, kept as
+            // letters so the rest of the line still converts.
+            for end in self.syllables_at(bytes, j) {
+                let score = base.score + UNKNOWN_PENALTY;
+                if dp[end].as_ref().is_none_or(|s| score > s.score) {
+                    dp[end] = Some(State {
+                        score,
+                        prev: j,
+                        word: "",
+                        raw: Some((j, end)),
+                    });
+                }
+            }
+        }
+
+        // Furthest reachable position; the rest is the partial tail.
+        let full_end = (0..=n).rev().find(|&i| dp[i].is_some()).unwrap_or(0);
+        let mut parts: Vec<&str> = Vec::new();
+        let mut i = full_end;
+        while i > 0 {
+            let s = dp[i].as_ref().unwrap();
+            match s.raw {
+                Some((a, b)) => parts.push(&lower[a..b]),
+                None => parts.push(s.word),
+            }
+            i = s.prev;
+        }
+        parts.reverse();
+        let mut best_line: String = parts.concat();
+        best_line.push_str(lower[full_end..].trim_start_matches('\''));
+
+        // Candidates: whole-line conversion first, then words starting at 0,
+        // longest span first, best score first within a span.
+        let mut starts: Vec<(usize, u128, f64)> = Vec::new();
+        self.walk_words(bytes, 0, |end, key| {
+            starts.push((end, key, self.words[&key][0].1));
+        });
+        starts.sort_by(|a, b| b.0.cmp(&a.0).then(b.2.total_cmp(&a.2)));
+
+        let mut candidates = Vec::new();
+        if full_end > 0 {
+            candidates.push(Candidate {
+                text: parts.concat(),
+                consumed_bytes: full_end,
+            });
+        }
+        'outer: for (end, key, _) in starts {
+            let take = if end == full_end { 4 } else { 3 };
+            for (w, _) in self.words[&key].iter().take(take) {
+                if candidates.iter().any(|c| c.text.as_str() == *w) {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    text: w.to_string(),
+                    consumed_bytes: end,
+                });
+                if candidates.len() >= 9 {
+                    break 'outer;
+                }
+            }
+        }
+        Analysis {
+            candidates,
+            best_line,
+        }
+    }
+
+    #[cfg(test)]
+    fn syllable_count(&self) -> usize {
+        self.syl_text.len()
+    }
+}
+
+/// Byte offset where the trailing pinyin run starts, or `text.len()` if none.
+/// A run is a trailing sequence of ASCII letters and apostrophes.
+pub fn run_start(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut start = bytes.len();
+    while start > 0 {
+        let c = bytes[start - 1];
+        if c.is_ascii_alphabetic() || c == b'\'' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    // A run must begin with a letter, not an apostrophe.
+    while start < bytes.len() && bytes[start] == b'\'' {
+        start += 1;
+    }
+    start
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_common_pinyin() {
+        let dict = PinyinDict::load();
+        assert!(dict.syllable_count() > 300);
+
+        let a = dict.analyze("nihao");
+        assert_eq!(a.candidates[0].text, "你好");
+        assert_eq!(a.candidates[0].consumed_bytes, 5);
+
+        let a = dict.analyze("jintianchileshenme");
+        assert!(a.best_line.contains("今天"), "got {}", a.best_line);
+        assert!(a.best_line.contains("什么"), "got {}", a.best_line);
+
+        // Trailing partial syllable is kept as letters. ("q" alone is not a
+        // syllable; "m" would be — 呒 has pinyin "m" in the AOSP dict.)
+        let a = dict.analyze("nihaoq");
+        assert!(a.best_line.starts_with("你好"), "got {}", a.best_line);
+        assert!(a.best_line.ends_with('q'), "got {}", a.best_line);
+
+        // Apostrophe forces a split: xi'an vs xian.
+        let a = dict.analyze("xi'an");
+        assert_eq!(a.candidates[0].text, "西安");
+
+        // Non-pinyin input passes through unharmed (UTF-8 safety guard).
+        let a = dict.analyze("nǐhǎo");
+        assert_eq!(a.best_line, "nǐhǎo");
+        assert!(a.candidates.is_empty());
+    }
+
+    #[test]
+    fn segmentation_ties_use_word_scores() {
+        // These all have an equal-syllable-count wrong split that a greedy
+        // segmenter picks; the joint Viterbi must choose the common word.
+        let dict = PinyinDict::load();
+        for (input, expect) in [
+            ("keneng", "可能"),
+            ("sange", "三个"),
+            ("jineng", "技能"),
+            ("dangao", "蛋糕"),
+        ] {
+            let a = dict.analyze(input);
+            assert_eq!(a.best_line, expect, "input {input}");
+        }
+    }
+}
