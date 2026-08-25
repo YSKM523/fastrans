@@ -13,7 +13,11 @@
 - **内置拼音输入**:没装中文输入法的电脑也能用——直接打拼音,数字选词、空格选首选、回车整句转换(`Ctrl+P` 可关,平时用系统输入法即可)
 - **不打扰**:不是真输入法、不改系统设置;粘贴前保存剪贴板、粘贴后自动还原;条可拖动、位置记忆
 
-## 快速开始(Windows)
+## 下载即用(Windows 10/11 x64)
+
+从 [**Releases**](https://github.com/YSKM523/fastrans/releases/latest) 下载 zip,解压,双击 `fastrans.exe`——模型已含在包内,无需安装任何东西。
+
+## 从源码构建
 
 需要 [Rust](https://rustup.rs/)(≥1.95)和 [CMake](https://cmake.org/download/):
 
