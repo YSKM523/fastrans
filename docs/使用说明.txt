@@ -1,0 +1,12 @@
+fastrans - 打中文,上屏英文(完全离线)
+
+1. 双击 fastrans.exe 启动(无窗口,后台待命,约 1 秒后热键生效)
+2. 在任何输入框旁按 Ctrl+Alt+Space 呼出翻译条
+   (若被占用会自动换 Ctrl+Shift+Space,实际热键显示在输入框提示里)
+3. 打中文(或直接打拼音)-> 英文实时出现 -> 回车自动粘贴进原应用
+
+快捷键: Esc 收起 | Ctrl+Q 退出 | Ctrl+P 内置拼音开关 | 空白处拖动移动位置
+开机自启: Win+R 输入 shell:startup,把 fastrans.exe 快捷方式放进去
+设置文件: %APPDATA%\fastrans\config.txt
+
+项目主页: https://github.com/YSKM523/fastrans

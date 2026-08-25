@@ -1,0 +1,70 @@
+# Push a tag like v0.2.0 and this builds the Windows one-click zip and
+# publishes it as a GitHub Release. Manual runs (workflow_dispatch) only
+# build and upload the zip as a CI artifact, without creating a release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
+          $stage = "fastrans-$tag-windows-x64"
+          New-Item -ItemType Directory -Force "$stage/models" | Out-Null
+          Copy-Item target/release/fastrans.exe $stage/
+          Copy-Item models/opus-mt-zh-en "$stage/models/opus-mt-zh-en" -Recurse
+          Copy-Item README.md, LICENSE $stage/
+          Copy-Item "docs/使用说明.txt" $stage/
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip" -CompressionLevel Optimal
+          $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash
+          "SHA256($stage.zip) = $hash" | Out-File checksums.txt -Encoding ascii
+          Get-Content checksums.txt
+          "ZIP_NAME=$stage.zip" | Out-File $env:GITHUB_ENV -Append -Encoding ascii
+
+      - name: Upload artifact (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: |
+            ${{ env.ZIP_NAME }}
+            checksums.txt
+
+      - name: Create release (tag pushes)
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $body = @(
+            '一键包:下载 zip 解压,双击 fastrans.exe 即用(Windows 10/11 x64,无需安装任何依赖,完全离线)。',
+            '',
+            '校验:',
+            '```',
+            (Get-Content checksums.txt -Raw).TrimEnd(),
+            '```',
+            '',
+            '变更记录见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)。'
+          ) -join "`n"
+          $body | Out-File release-notes.md -Encoding utf8
+          gh release create $tag $env:ZIP_NAME checksums.txt --title $tag --notes-file release-notes.md
