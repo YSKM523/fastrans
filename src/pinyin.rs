@@ -41,6 +41,14 @@ const MAX_WORD_SYLS: usize = 8;
 const SYL_BITS: u32 = 9;
 /// Score for a syllable that matches no dictionary word (emitted as letters).
 const UNKNOWN_PENALTY: f64 = -30.0;
+/// Per-syllable penalty for an abbreviated (简拼) match in the sentence
+/// lattice: full-pinyin parses must always win when they exist, but a
+/// jianpin edge must still beat the raw-letters fallback.
+const ABBREV_PENALTY: f64 = -5.0;
+/// Extra per-word cost for jianpin edges, so fewer/longer words win over
+/// chains of ultra-frequent single characters ("wmdl" -> 我们+到了, not
+/// 我们+的+了).
+const ABBREV_EDGE_COST: f64 = -2.5;
 /// Runs longer than this are not analyzed (pasted ASCII blobs).
 const MAX_RUN_BYTES: usize = 64;
 
@@ -59,9 +67,9 @@ pub struct PinyinDict {
     max_syllable_len: usize,
 }
 
-/// Packs 2..=8 lowercase letters into a u64 jianpin key.
+/// Packs 1..=8 lowercase letters into a u64 jianpin key.
 fn pack_initials(letters: &[u8]) -> Option<u64> {
-    if !(2..=8).contains(&letters.len()) {
+    if !(1..=8).contains(&letters.len()) {
         return None;
     }
     let mut key = 0u64;
@@ -235,6 +243,7 @@ impl PinyinDict {
         }
         let lower = run.to_ascii_lowercase();
         let bytes = lower.as_bytes();
+        let orig = run.as_bytes();
         let n = bytes.len();
 
         // Joint Viterbi over byte positions. dp[i] = best (score, prev, word).
@@ -305,6 +314,42 @@ impl PinyinDict {
                         prev: j,
                         word: "",
                         raw: Some((j, end)),
+                    });
+                }
+            }
+            // 简拼 word edges: L letters taken as L syllable initials, so a
+            // word is reachable from its abbreviation ("wm" -> 我们) and full
+            // pinyin mixes freely with jianpin ("w" + "buxiangquchifan").
+            // The per-syllable penalty keeps full parses on top; uppercase
+            // letters mean deliberate literal text and are never jianpin.
+            for len in 1..=MAX_WORD_SYLS.min(n - j) {
+                if bytes[j + len - 1] == b'\'' || orig[j + len - 1].is_ascii_uppercase() {
+                    break;
+                }
+                let Some(ws) =
+                    pack_initials(&bytes[j..j + len]).and_then(|k| self.abbrev.get(&k))
+                else {
+                    continue;
+                };
+                let (word, gain) = if user.is_untrained() {
+                    ws[0]
+                } else {
+                    let mut best = (ws[0].0, ws[0].1 + user_boost(user, ws[0].0));
+                    for &(w, g) in &ws[1..] {
+                        let g = g + user_boost(user, w);
+                        if g > best.1 {
+                            best = (w, g);
+                        }
+                    }
+                    best
+                };
+                let score = base.score + gain + ABBREV_PENALTY * len as f64 + ABBREV_EDGE_COST;
+                if dp[j + len].as_ref().is_none_or(|s| score > s.score) {
+                    dp[j + len] = Some(State {
+                        score,
+                        prev: j,
+                        word,
+                        raw: None,
                     });
                 }
             }
@@ -417,9 +462,9 @@ impl PinyinDict {
                         best_line = c.text.clone();
                     }
                 } else {
-                    let keep = MAX_CANDIDATES - jianpin.len().min(5);
+                    let keep = MAX_CANDIDATES - jianpin.len().min(8);
                     candidates.truncate(keep);
-                    candidates.extend(jianpin.into_iter().take(5));
+                    candidates.extend(jianpin.into_iter().take(8));
                 }
             }
         }
@@ -473,11 +518,15 @@ mod tests {
         assert!(a.best_line.contains("今天"), "got {}", a.best_line);
         assert!(a.best_line.contains("什么"), "got {}", a.best_line);
 
-        // Trailing partial syllable is kept as letters. ("q" alone is not a
-        // syllable; "m" would be — 呒 has pinyin "m" in the AOSP dict.)
+        // A trailing single letter now converts as jianpin (sentence
+        // abbreviation support) instead of dangling as a raw letter.
         let a = dict.analyze("nihaoq", &user);
         assert!(a.best_line.starts_with("你好"), "got {}", a.best_line);
-        assert!(a.best_line.ends_with('q'), "got {}", a.best_line);
+        assert!(
+            !a.best_line.contains(|c: char| c.is_ascii_alphabetic()),
+            "got {}",
+            a.best_line
+        );
 
         // Apostrophe forces a split: xi'an vs xian.
         let a = dict.analyze("xi'an", &user);
@@ -504,6 +553,26 @@ mod tests {
             let a = dict.analyze(input, &user);
             assert_eq!(a.best_line, expect, "input {input}");
         }
+    }
+
+    #[test]
+    fn sentence_jianpin_and_mixed() {
+        let dict = PinyinDict::load();
+        let user = UserDict::default();
+        // Whole-sentence jianpin: every letter is an initial.
+        let a = dict.analyze("wmdl", &user);
+        assert_eq!(a.best_line, "我们到了", "wmdl -> {}", a.best_line);
+        // Jianpin mixed with full pinyin.
+        let a = dict.analyze("wbuxiangquchifan", &user);
+        assert_eq!(a.best_line, "我不想去吃饭", "got {}", a.best_line);
+        // Full-pinyin parses still beat jianpin interpretations.
+        let a = dict.analyze("nihao", &user);
+        assert_eq!(a.best_line, "你好");
+        let a = dict.analyze("jintianchileshenme", &user);
+        assert!(a.best_line.contains("今天"), "got {}", a.best_line);
+        // Uppercase input is literal, never jianpin-converted.
+        let a = dict.analyze("GPT", &user);
+        assert!(!a.best_line.contains(|c: char| c > '\u{7f}'), "got {}", a.best_line);
     }
 
     #[test]
