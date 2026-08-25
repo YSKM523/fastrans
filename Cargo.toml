@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "fastrans"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["YSKM523"]
 license = "MIT"
@@ -14,6 +14,8 @@ global-hotkey = "0.8"
 arboard = "3.6"
 enigo = "0.6"
 ct2rs = { version = "0.10", features = ["sentencepiece"] }
+ureq = "2"
+flate2 = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

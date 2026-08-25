@@ -39,6 +39,7 @@ pub struct FastransApp {
     pinyin_enabled: bool,
     /// Last known window position, persisted so drags are remembered.
     window_pos: Option<(f32, f32)>,
+    autoupdate: bool,
     ime_debug: bool,
 
     input: String,
@@ -72,11 +73,15 @@ impl FastransApp {
             res_rx,
             toggle,
             _hotkey_manager: hotkey_manager,
-            hint: format!("输入中文,回车上屏英文 · {hotkey_spec} · ^Q退出 ^P拼音"),
+            hint: format!(
+                "输入中文,回车上屏英文 · {hotkey_spec} · ^Q退出 ^P拼音 · v{}",
+                env!("CARGO_PKG_VERSION")
+            ),
             pinyin,
             pinyin_cache: None,
             pinyin_enabled: settings.pinyin,
             window_pos: settings.pos,
+            autoupdate: settings.autoupdate,
             ime_debug: std::env::var_os("FASTRANS_IME_DEBUG").is_some(),
             input: String::new(),
             output: String::new(),
@@ -94,6 +99,7 @@ impl FastransApp {
     fn save_settings(&self) {
         config::save(config::Settings {
             pinyin: self.pinyin_enabled,
+            autoupdate: self.autoupdate,
             pos: self.window_pos,
         });
     }

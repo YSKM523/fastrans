@@ -24,6 +24,11 @@ fn main() -> eframe::Result<()> {
     let dict_thread = thread::spawn(fastrans::pinyin::PinyinDict::load);
 
     let settings = fastrans::config::load();
+    fastrans::update::cleanup_old();
+    if settings.autoupdate {
+        // Silent background check; a newer exe is swapped in for next launch.
+        fastrans::update::spawn_check();
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([560.0, 118.0])
         .with_decorations(false)

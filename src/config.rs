@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct Settings {
     /// Built-in pinyin fallback on/off (Ctrl+P).
     pub pinyin: bool,
+    /// Silent self-update check at launch.
+    pub autoupdate: bool,
     /// Last bar position in logical points (drag to move, remembered).
     pub pos: Option<(f32, f32)>,
 }
@@ -15,6 +17,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             pinyin: true,
+            autoupdate: true,
             pos: None,
         }
     }
@@ -33,6 +36,7 @@ pub fn load() -> Settings {
     for line in text.lines() {
         match line.trim().split_once('=') {
             Some(("pinyin", v)) => s.pinyin = v.trim() != "0",
+            Some(("autoupdate", v)) => s.autoupdate = v.trim() != "0",
             Some(("pos", v)) => {
                 if let Some((x, y)) = v.split_once(',') {
                     if let (Ok(x), Ok(y)) = (x.trim().parse(), y.trim().parse()) {
@@ -51,7 +55,11 @@ pub fn save(s: Settings) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut out = format!("pinyin={}\n", if s.pinyin { 1 } else { 0 });
+    let mut out = format!(
+        "pinyin={}\nautoupdate={}\n",
+        if s.pinyin { 1 } else { 0 },
+        if s.autoupdate { 1 } else { 0 }
+    );
     if let Some((x, y)) = s.pos {
         out.push_str(&format!("pos={x:.0},{y:.0}\n"));
     }
