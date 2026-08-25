@@ -16,7 +16,25 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::userdict::UserDict;
+
 const DICT: &str = include_str!("../assets/pinyin_dict.txt");
+/// Weight of the user's pick history in conversion scoring.
+const USER_BOOST: f64 = 1.5;
+/// Boost ceiling: without it, heavily-picked short words out-bid correct
+/// longer words and whole-line conversion fragments over time.
+const USER_BOOST_CAP: f64 = 3.5;
+/// Total candidate cap (paged 5 at a time in the UI).
+const MAX_CANDIDATES: usize = 45;
+
+fn user_boost(user: &UserDict, word: &str) -> f64 {
+    let n = user.count(word);
+    if n == 0 {
+        0.0
+    } else {
+        (USER_BOOST * (1.0 + n as f64).ln()).min(USER_BOOST_CAP)
+    }
+}
 /// Longest word (in syllables) we look up.
 const MAX_WORD_SYLS: usize = 8;
 /// Bits per syllable id in a packed key (416 syllables < 512).
@@ -171,7 +189,8 @@ impl PinyinDict {
 
     /// Analyzes a pinyin run: candidate list + whole-run best conversion.
     /// Non-pinyin input (non-ASCII, too long) returns the run unchanged.
-    pub fn analyze(&self, run: &str) -> Analysis {
+    /// `user` biases both ranking and conversion toward past picks.
+    pub fn analyze(&self, run: &str, user: &UserDict) -> Analysis {
         if run.len() > MAX_RUN_BYTES
             || !run.bytes().all(|b| b.is_ascii_alphabetic() || b == b'\'')
         {
@@ -215,7 +234,23 @@ impl PinyinDict {
                 continue;
             }
             self.walk_words(bytes, j, |end, key| {
-                let (word, gain) = self.words[&key][0];
+                // Among words sharing this key, prefer the user's picks.
+                // Untrained users skip the scan entirely; trained ones scan
+                // the full list so a deep-ranked remembered word can still
+                // win (the candidate row uses the same rule).
+                let words = &self.words[&key];
+                let (word, gain) = if user.is_untrained() {
+                    words[0]
+                } else {
+                    let mut best = (words[0].0, words[0].1 + user_boost(user, words[0].0));
+                    for &(w, g) in &words[1..] {
+                        let g = g + user_boost(user, w);
+                        if g > best.1 {
+                            best = (w, g);
+                        }
+                    }
+                    best
+                };
                 let score = base.score + gain;
                 if dp[end].as_ref().is_none_or(|s| score > s.score) {
                     dp[end] = Some(State {
@@ -244,11 +279,15 @@ impl PinyinDict {
         // Furthest reachable position; the rest is the partial tail.
         let full_end = (0..=n).rev().find(|&i| dp[i].is_some()).unwrap_or(0);
         let mut parts: Vec<&str> = Vec::new();
+        let mut has_raw = false;
         let mut i = full_end;
         while i > 0 {
             let s = dp[i].as_ref().unwrap();
             match s.raw {
-                Some((a, b)) => parts.push(&lower[a..b]),
+                Some((a, b)) => {
+                    parts.push(&lower[a..b]);
+                    has_raw = true;
+                }
                 None => parts.push(s.word),
             }
             i = s.prev;
@@ -257,32 +296,60 @@ impl PinyinDict {
         let mut best_line: String = parts.concat();
         best_line.push_str(lower[full_end..].trim_start_matches('\''));
 
-        // Candidates: whole-line conversion first, then words starting at 0,
-        // longest span first, best score first within a span.
+        // Candidates, in order: user picks that cover the whole convertible
+        // prefix, the whole-line conversion, shorter user picks, then
+        // dictionary words starting at byte 0 (longest span first). A user
+        // pick that covers less than the whole line must NOT sit above it —
+        // otherwise space commits a partial word and re-recording it
+        // entrenches the wrong default. The UI pages these 5 at a time.
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut push = |cands: &mut Vec<Candidate>, text: &str, consumed: usize| {
+            if !cands
+                .iter()
+                .any(|c| c.text == text && c.consumed_bytes == consumed)
+            {
+                cands.push(Candidate {
+                    text: text.to_string(),
+                    consumed_bytes: consumed,
+                });
+            }
+        };
+        let remembered = user.prefix_matches(&lower);
+        for (consumed, w, _) in remembered.iter().filter(|(c, _, _)| *c >= full_end) {
+            push(&mut candidates, w, *consumed);
+        }
+        // Skip the whole-line candidate when it contains raw letters — a
+        // half-converted string is not something to commit or memorize.
+        if full_end > 0 && !has_raw {
+            let text = parts.concat();
+            push(&mut candidates, &text, full_end);
+        }
+        for (consumed, w, _) in remembered.iter().filter(|(c, _, _)| *c < full_end) {
+            push(&mut candidates, w, *consumed);
+        }
         let mut starts: Vec<(usize, u128, f64)> = Vec::new();
         self.walk_words(bytes, 0, |end, key| {
             starts.push((end, key, self.words[&key][0].1));
         });
         starts.sort_by(|a, b| b.0.cmp(&a.0).then(b.2.total_cmp(&a.2)));
-
-        let mut candidates = Vec::new();
-        if full_end > 0 {
-            candidates.push(Candidate {
-                text: parts.concat(),
-                consumed_bytes: full_end,
-            });
-        }
         'outer: for (end, key, _) in starts {
-            let take = if end == full_end { 4 } else { 3 };
-            for (w, _) in self.words[&key].iter().take(take) {
-                if candidates.iter().any(|c| c.text.as_str() == *w) {
+            // Same scan-and-boost rule as the Viterbi, so what the row shows
+            // first is also what Enter's whole-line conversion would use.
+            let mut ws: Vec<(&str, f64)> = self.words[&key]
+                .iter()
+                .map(|&(w, g)| (w, g + user_boost(user, w)))
+                .collect();
+            ws.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let take = if end == full_end { 10 } else { 8 };
+            for (w, _) in ws.into_iter().take(take) {
+                if candidates.iter().any(|c| c.text.as_str() == w) {
                     continue;
                 }
                 candidates.push(Candidate {
                     text: w.to_string(),
                     consumed_bytes: end,
                 });
-                if candidates.len() >= 9 {
+                if candidates.len() >= MAX_CANDIDATES {
                     break 'outer;
                 }
             }
@@ -326,28 +393,29 @@ mod tests {
     #[test]
     fn converts_common_pinyin() {
         let dict = PinyinDict::load();
+        let user = UserDict::default();
         assert!(dict.syllable_count() > 300);
 
-        let a = dict.analyze("nihao");
+        let a = dict.analyze("nihao", &user);
         assert_eq!(a.candidates[0].text, "你好");
         assert_eq!(a.candidates[0].consumed_bytes, 5);
 
-        let a = dict.analyze("jintianchileshenme");
+        let a = dict.analyze("jintianchileshenme", &user);
         assert!(a.best_line.contains("今天"), "got {}", a.best_line);
         assert!(a.best_line.contains("什么"), "got {}", a.best_line);
 
         // Trailing partial syllable is kept as letters. ("q" alone is not a
         // syllable; "m" would be — 呒 has pinyin "m" in the AOSP dict.)
-        let a = dict.analyze("nihaoq");
+        let a = dict.analyze("nihaoq", &user);
         assert!(a.best_line.starts_with("你好"), "got {}", a.best_line);
         assert!(a.best_line.ends_with('q'), "got {}", a.best_line);
 
         // Apostrophe forces a split: xi'an vs xian.
-        let a = dict.analyze("xi'an");
+        let a = dict.analyze("xi'an", &user);
         assert_eq!(a.candidates[0].text, "西安");
 
         // Non-pinyin input passes through unharmed (UTF-8 safety guard).
-        let a = dict.analyze("nǐhǎo");
+        let a = dict.analyze("nǐhǎo", &user);
         assert_eq!(a.best_line, "nǐhǎo");
         assert!(a.candidates.is_empty());
     }
@@ -357,14 +425,46 @@ mod tests {
         // These all have an equal-syllable-count wrong split that a greedy
         // segmenter picks; the joint Viterbi must choose the common word.
         let dict = PinyinDict::load();
+        let user = UserDict::default();
         for (input, expect) in [
             ("keneng", "可能"),
             ("sange", "三个"),
             ("jineng", "技能"),
             ("dangao", "蛋糕"),
         ] {
-            let a = dict.analyze(input);
+            let a = dict.analyze(input, &user);
             assert_eq!(a.best_line, expect, "input {input}");
         }
+    }
+
+    #[test]
+    fn user_memory_ranks_first() {
+        let dict = PinyinDict::load();
+        let mut user = UserDict::default();
+        user.record_pick("shizi", "狮子", None);
+        user.record_pick("shizi", "狮子", None);
+        // Remembered pick outranks whatever the dictionary prefers.
+        let a = dict.analyze("shizi", &user);
+        assert_eq!(a.candidates[0].text, "狮子");
+        // While more pinyin follows, the whole-line conversion stays first
+        // (a partial pick above it would make space commit half a phrase),
+        // with the remembered word right behind it — and the Viterbi itself
+        // picks the remembered word inside the line.
+        let a = dict.analyze("shizihen", &user);
+        assert!(a.candidates[0].text.starts_with("狮子"), "got {:?}", a.candidates[0]);
+        assert!(
+            a.candidates[1..3]
+                .iter()
+                .any(|c| c.text == "狮子" && c.consumed_bytes == 5),
+            "got {:?}",
+            &a.candidates[..3]
+        );
+        // Heavy use also biases whole-line conversion.
+        let mut heavy = UserDict::default();
+        for _ in 0..200 {
+            heavy.record_pick("shi", "试", None);
+        }
+        let a = dict.analyze("shi", &heavy);
+        assert_eq!(a.candidates[0].text, "试");
     }
 }

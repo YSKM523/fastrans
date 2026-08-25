@@ -12,17 +12,21 @@ use crate::config;
 use crate::engine::{Job, TransResult};
 use crate::inject;
 use crate::pinyin::{self, Analysis, PinyinDict};
+use crate::userdict::UserDict;
 
 // With the oneDNN engine at 30-100ms per sentence, a short debounce keeps the
 // preview snappy without flooding the worker.
 const DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// Candidates shown per page; `-`/`=` (or `,`/`.`, arrow keys) page around.
+const PAGE_SIZE: usize = 5;
+
 /// Cached per-run pinyin state: analysis plus the pre-rendered candidate
-/// labels, so cursor-blink repaints allocate nothing.
+/// labels (chunked into pages), so cursor-blink repaints allocate nothing.
 struct PinyinUi {
     run: String,
     analysis: Analysis,
-    labels: Vec<String>,
+    pages: Vec<Vec<String>>,
 }
 
 pub struct FastransApp {
@@ -34,6 +38,14 @@ pub struct FastransApp {
     hint: String,
     pinyin: PinyinDict,
     pinyin_cache: Option<PinyinUi>,
+    /// Per-user pick memory + follow suggestions, persisted.
+    user: UserDict,
+    /// Current candidate page.
+    page: usize,
+    /// Last committed word, the seed for follow-up suggestions (联想).
+    last_word: Option<String>,
+    /// Cached suggestion list for the current seed word.
+    sugg_cache: Option<(String, Vec<String>)>,
     /// Built-in pinyin fallback on/off (Ctrl+P, persisted). Machines with a
     /// native IME don't need it — the native IME stays primary.
     pinyin_enabled: bool,
@@ -79,6 +91,10 @@ impl FastransApp {
             ),
             pinyin,
             pinyin_cache: None,
+            user: UserDict::load(),
+            page: 0,
+            last_word: None,
+            sugg_cache: None,
             pinyin_enabled: settings.pinyin,
             window_pos: settings.pos,
             autoupdate: settings.autoupdate,
@@ -120,6 +136,9 @@ impl FastransApp {
         } else {
             self.capture_pos(ctx);
             self.save_settings();
+            self.user.save_if_dirty();
+            self.last_word = None;
+            self.page = 0;
             self.input.clear();
             self.output.clear();
             self.dirty = false;
@@ -177,27 +196,55 @@ impl FastransApp {
 
     fn ensure_pinyin_ui(&mut self, run: &str) -> &PinyinUi {
         if self.pinyin_cache.as_ref().map(|c| c.run.as_str()) != Some(run) {
-            let analysis = self.pinyin.analyze(run);
-            let labels = analysis
+            // Long labels are clipped so the single-line row can't starve the
+            // translation area below it out of the fixed-height window.
+            fn clip(s: &str, max: usize) -> String {
+                if s.chars().count() > max {
+                    let mut t: String = s.chars().take(max).collect();
+                    t.push('…');
+                    t
+                } else {
+                    s.to_string()
+                }
+            }
+            let analysis = self.pinyin.analyze(run, &self.user);
+            let pages = analysis
                 .candidates
-                .iter()
-                .take(6)
+                .chunks(PAGE_SIZE)
                 .enumerate()
-                .map(|(i, c)| format!("{} {}", i + 1, c.text))
+                .map(|(pg, chunk)| {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let max = if pg == 0 && i == 0 { 18 } else { 8 };
+                            format!("{} {}", i + 1, clip(&c.text, max))
+                        })
+                        .collect()
+                })
                 .collect();
             self.pinyin_cache = Some(PinyinUi {
                 run: run.to_string(),
                 analysis,
-                labels,
+                pages,
             });
+            self.page = 0;
         }
         self.pinyin_cache.as_ref().unwrap()
     }
 
-    /// Applies pinyin candidate `pick` to the trailing run. The selection keys
-    /// (digits/space) are intercepted before TextEdit ever sees them, so the
-    /// chosen text renders in the same frame with no digit flicker.
-    fn apply_selection(&mut self, pick: usize) {
+    /// Cached follow-up suggestions for `prev` (rebuilt when `prev` changes).
+    fn suggestions_for(&mut self, prev: &str) -> &[String] {
+        if self.sugg_cache.as_ref().map(|(p, _)| p.as_str()) != Some(prev) {
+            self.sugg_cache = Some((prev.to_string(), self.user.suggestions(prev)));
+        }
+        &self.sugg_cache.as_ref().unwrap().1
+    }
+
+    /// Applies pinyin candidate `pick` (absolute index) to the trailing run.
+    /// The selection keys are intercepted before TextEdit ever sees them, so
+    /// the chosen text renders in the same frame with no digit flicker.
+    fn apply_selection(&mut self, pick: usize, ctx: &egui::Context) {
         let (start, run) = self.pinyin_run();
         if run.is_empty() {
             return;
@@ -206,10 +253,51 @@ impl FastransApp {
         let cand = self.analysis_for(&run).candidates.get(pick).cloned();
         // No such candidate: swallow the key like a real IME would.
         let Some(cand) = cand else { return };
+        // Remember the pick (unless it still contains raw letters): the same
+        // pinyin ranks it first next time, and the previous word links to it
+        // for follow-up suggestions.
+        if !cand.text.bytes().any(|b| b.is_ascii_alphanumeric()) {
+            self.user.record_pick(
+                &run[..cand.consumed_bytes].to_ascii_lowercase(),
+                &cand.text,
+                self.last_word.as_deref(),
+            );
+            self.last_word = Some(cand.text.clone());
+        }
         let rest = run[cand.consumed_bytes..].trim_start_matches('\'');
         self.input = format!("{}{}{}", &self.input[..start], cand.text, rest);
+        // The pick changed the rankings: rebuild on next use.
+        self.pinyin_cache = None;
+        self.page = 0;
+        self.caret_to_end(ctx);
         self.dirty = true;
         self.last_edit = Instant::now();
+    }
+
+    /// Appends a follow-up suggestion (联想, mouse-picked) to the input.
+    fn apply_suggestion(&mut self, word: &str, ctx: &egui::Context) {
+        let Some(prev) = self.last_word.clone() else {
+            return;
+        };
+        self.user.record_follow(&prev, word);
+        self.input.push_str(word);
+        self.last_word = Some(word.to_string());
+        self.caret_to_end(ctx);
+        self.dirty = true;
+        self.last_edit = Instant::now();
+    }
+
+    /// Moves the TextEdit caret to the end after the buffer was rewritten
+    /// behind the widget's back (candidate/suggestion insertion).
+    fn caret_to_end(&self, ctx: &egui::Context) {
+        let id = egui::Id::new("bar_input");
+        if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+            let end = egui::text::CCursor::new(self.input.chars().count());
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(end)));
+            state.store(ctx, id);
+        }
     }
 
     /// Converts any trailing pinyin in place (used on Enter).
@@ -330,36 +418,112 @@ impl eframe::App for FastransApp {
                 ctx.set_cursor_icon(egui::CursorIcon::Grab);
             }
 
-            // Intercept pinyin selection keys (digits 1-9, space) BEFORE the
-            // TextEdit consumes them: the chosen candidate then renders this
-            // same frame, with no digit flashing in the buffer first.
-            if !self.pinyin_run().1.is_empty() {
-                let mut picked: Option<usize> = None;
+            // Intercept IME keys BEFORE the TextEdit consumes them, so the
+            // result renders in this same frame with no key flashing in the
+            // buffer. Interception happens ONLY while real pinyin is being
+            // composed (the trailing run yields candidates) — plain English
+            // like "GPT-4" or "Wi-Fi" must keep its digits and punctuation.
+            // Suggestions (联想) are mouse-only and never steal keys.
+            // At most one selection/paging event is honoured per frame (a
+            // batched later keystroke would otherwise act on stale state).
+            let composing = {
+                let run = self.pinyin_run().1;
+                if run.is_empty() {
+                    false
+                } else {
+                    let run = run.to_string();
+                    !self.ensure_pinyin_ui(&run).analysis.candidates.is_empty()
+                }
+            };
+            if composing {
+                #[derive(Clone, Copy)]
+                enum Act {
+                    Pick(usize),
+                    Swallow,
+                    Page(i32),
+                }
+                let mut act: Option<Act> = None;
                 ui.input_mut(|i| {
                     i.events.retain(|e| {
-                        if picked.is_some() {
+                        if act.is_some() {
                             return true;
                         }
-                        if let egui::Event::Text(t) = e {
-                            let b = t.as_bytes();
-                            if b == b" " {
-                                picked = Some(0);
-                                return false;
+                        match e {
+                            egui::Event::Text(t) => {
+                                let b = t.as_bytes();
+                                if b.len() != 1 {
+                                    return true;
+                                }
+                                match b[0] {
+                                    b' ' => {
+                                        act = Some(Act::Pick(0));
+                                        false
+                                    }
+                                    d @ b'1'..=b'9' => {
+                                        let d = (d - b'1') as usize;
+                                        // Digits past the visible page pick
+                                        // nothing but are swallowed like a
+                                        // real IME would.
+                                        act = Some(if d < PAGE_SIZE {
+                                            Act::Pick(d)
+                                        } else {
+                                            Act::Swallow
+                                        });
+                                        false
+                                    }
+                                    b'-' | b',' => {
+                                        act = Some(Act::Page(-1));
+                                        false
+                                    }
+                                    b'=' | b'.' => {
+                                        act = Some(Act::Page(1));
+                                        false
+                                    }
+                                    _ => true,
+                                }
                             }
-                            if b.len() == 1 && (b'1'..=b'9').contains(&b[0]) {
-                                picked = Some((b[0] - b'1') as usize);
-                                return false;
-                            }
+                            egui::Event::Key {
+                                key,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if modifiers.is_none() => match key {
+                                Key::ArrowUp | Key::PageUp => {
+                                    act = Some(Act::Page(-1));
+                                    false
+                                }
+                                Key::ArrowDown | Key::PageDown => {
+                                    act = Some(Act::Page(1));
+                                    false
+                                }
+                                _ => true,
+                            },
+                            _ => true,
                         }
-                        true
                     });
                 });
-                if let Some(pick) = picked {
-                    self.apply_selection(pick);
+                let n_pages = self
+                    .pinyin_cache
+                    .as_ref()
+                    .map(|c| c.pages.len().max(1))
+                    .unwrap_or(1);
+                self.page = self.page.min(n_pages - 1);
+                match act {
+                    Some(Act::Pick(d)) => {
+                        let pick = self.page * PAGE_SIZE + d;
+                        self.apply_selection(pick, &ctx);
+                    }
+                    Some(Act::Page(delta)) => {
+                        self.page = (self.page as i64 + delta as i64)
+                            .clamp(0, n_pages as i64 - 1)
+                            as usize;
+                    }
+                    Some(Act::Swallow) | None => {}
                 }
             }
 
             let edit = egui::TextEdit::singleline(&mut self.input)
+                .id(egui::Id::new("bar_input"))
                 .hint_text(self.hint.as_str())
                 .font(egui::FontId::proportional(19.0))
                 .desired_width(f32::INFINITY)
@@ -370,33 +534,94 @@ impl eframe::App for FastransApp {
             if std::mem::take(&mut self.focus_next) {
                 response.request_focus();
             }
+            // Note: the 联想 seed is NOT cleared on edits — the suggestion
+            // row's own gate (input must still end with the seed word) hides
+            // it naturally and lets it return after a backspace.
             if response.changed() {
                 self.dirty = true;
                 self.last_edit = Instant::now();
                 ctx.request_repaint_after(DEBOUNCE);
             }
 
-            // Built-in pinyin candidates (for machines without a Chinese IME):
-            // digits pick a candidate, space picks the first. The label cache
-            // makes cursor-blink repaints allocation-free.
-            if !self.pinyin_run().1.is_empty() {
-                let stale = self.pinyin_cache.as_ref().map(|c| c.run.as_str())
-                    != Some(self.pinyin_run().1);
-                if stale {
-                    let run = self.pinyin_run().1.to_string();
-                    self.ensure_pinyin_ui(&run);
-                }
-                let labels = &self.pinyin_cache.as_ref().unwrap().labels;
+            // Candidate row (paged, single line, clickable), or the mouse-only
+            // follow-up suggestion row (联想) when nothing is being composed.
+            // Labels are cached per run so cursor-blink repaints stay cheap.
+            // Re-evaluated here (not via `composing`): a selection above may
+            // have rewritten the buffer and invalidated the cache this frame.
+            let run_after = self.pinyin_run().1;
+            if !run_after.is_empty() {
+                let run = run_after.to_string();
+                self.ensure_pinyin_ui(&run);
+                let cache = self.pinyin_cache.as_ref().unwrap();
+                let n_pages = cache.pages.len().max(1);
+                let page = self.page.min(n_pages - 1);
+                let mut clicked: Option<usize> = None;
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    for text in labels {
+                    if n_pages > 1 {
                         ui.label(
-                            RichText::new(text)
-                                .size(14.0)
-                                .color(Color32::from_rgb(200, 180, 120)),
+                            RichText::new(format!("{}/{}", page + 1, n_pages))
+                                .size(12.0)
+                                .color(Color32::from_gray(120)),
                         );
                     }
+                    if let Some(labels) = cache.pages.get(page) {
+                        for (i, text) in labels.iter().enumerate() {
+                            let r = ui.add(
+                                egui::Label::new(
+                                    RichText::new(text)
+                                        .size(14.0)
+                                        .color(Color32::from_rgb(200, 180, 120)),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if r.clicked() {
+                                clicked = Some(page * PAGE_SIZE + i);
+                            }
+                        }
+                    }
                 });
+                if let Some(pick) = clicked {
+                    self.apply_selection(pick, &ctx);
+                }
+            } else if self.pinyin_enabled && self.pinyin_run().1.is_empty() {
+                // Suggestion row: only while the input still ends with the
+                // seed word (so it disappears on other edits and comes back
+                // after a backspace), and never touches the keyboard.
+                let seed = self
+                    .last_word
+                    .clone()
+                    .filter(|w| self.input.ends_with(w.as_str()));
+                if let Some(seed) = seed {
+                    let words: Vec<String> = self.suggestions_for(&seed).to_vec();
+                    if !words.is_empty() {
+                        let mut clicked: Option<String> = None;
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("联想")
+                                    .size(12.0)
+                                    .color(Color32::from_gray(120)),
+                            );
+                            for w in &words {
+                                let r = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(w)
+                                            .size(14.0)
+                                            .color(Color32::from_rgb(150, 190, 160)),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                );
+                                if r.clicked() {
+                                    clicked = Some(w.clone());
+                                }
+                            }
+                        });
+                        if let Some(word) = clicked {
+                            self.apply_suggestion(&word, &ctx);
+                        }
+                    }
+                }
             }
 
             ui.add_space(8.0);
@@ -407,7 +632,14 @@ impl eframe::App for FastransApp {
                     .size(16.0)
                     .color(Color32::from_rgb(140, 200, 255))
             };
-            ui.label(shown);
+            // Long translations wrap and scroll (mouse wheel) instead of
+            // overflowing the fixed-height bar.
+            egui::ScrollArea::vertical()
+                .max_height(ui.available_height())
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(shown);
+                });
 
             let (enter, esc, quit, toggle_pinyin) = ui.input(|i| {
                 (
@@ -420,15 +652,19 @@ impl eframe::App for FastransApp {
             if quit {
                 // Ctrl+Q: quit for real. ViewportCommand::Close hangs in some
                 // component's drop (observed: window gone, process stuck), and
-                // config is flushed right here.
+                // everything is flushed right here.
                 self.capture_pos(&ctx);
                 self.save_settings();
+                self.user.save_if_dirty();
                 std::process::exit(0);
             }
             if toggle_pinyin {
                 self.pinyin_enabled = !self.pinyin_enabled;
                 self.save_settings();
                 self.pinyin_cache = None;
+                self.page = 0;
+                self.last_word = None;
+                self.sugg_cache = None;
                 self.output = if self.pinyin_enabled {
                     "内置拼音:开(无系统输入法时的兜底)".into()
                 } else {

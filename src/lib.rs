@@ -5,3 +5,4 @@ pub mod hotkey;
 pub mod inject;
 pub mod pinyin;
 pub mod update;
+pub mod userdict;
