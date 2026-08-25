@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         let t = Instant::now();
-        let en = engine.translate(&line)?;
+        let en = fastrans::style::polish(&engine.translate(&line)?);
         writeln!(out, "[{:>6.1?}] {en}", t.elapsed())?;
     }
     Ok(())

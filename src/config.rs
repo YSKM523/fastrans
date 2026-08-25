@@ -9,6 +9,8 @@ pub struct Settings {
     pub pinyin: bool,
     /// Silent self-update check at launch.
     pub autoupdate: bool,
+    /// North-American business-casual polish of the English output.
+    pub style: bool,
     /// Last bar position in logical points (drag to move, remembered).
     pub pos: Option<(f32, f32)>,
 }
@@ -18,6 +20,7 @@ impl Default for Settings {
         Self {
             pinyin: true,
             autoupdate: true,
+            style: true,
             pos: None,
         }
     }
@@ -37,6 +40,7 @@ pub fn load() -> Settings {
         match line.trim().split_once('=') {
             Some(("pinyin", v)) => s.pinyin = v.trim() != "0",
             Some(("autoupdate", v)) => s.autoupdate = v.trim() != "0",
+            Some(("style", v)) => s.style = v.trim() != "0",
             Some(("pos", v)) => {
                 if let Some((x, y)) = v.split_once(',') {
                     if let (Ok(x), Ok(y)) = (x.trim().parse(), y.trim().parse()) {
@@ -56,9 +60,10 @@ pub fn save(s: Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut out = format!(
-        "pinyin={}\nautoupdate={}\n",
+        "pinyin={}\nautoupdate={}\nstyle={}\n",
         if s.pinyin { 1 } else { 0 },
-        if s.autoupdate { 1 } else { 0 }
+        if s.autoupdate { 1 } else { 0 },
+        if s.style { 1 } else { 0 }
     );
     if let Some((x, y)) = s.pos {
         out.push_str(&format!("pos={x:.0},{y:.0}\n"));

@@ -4,5 +4,6 @@ pub mod engine;
 pub mod hotkey;
 pub mod inject;
 pub mod pinyin;
+pub mod style;
 pub mod update;
 pub mod userdict;

@@ -12,6 +12,7 @@ use crate::config;
 use crate::engine::{Job, TransResult};
 use crate::inject;
 use crate::pinyin::{self, Analysis, PinyinDict};
+use crate::style;
 use crate::userdict::UserDict;
 
 // With the oneDNN engine at 30-100ms per sentence, a short debounce keeps the
@@ -52,6 +53,8 @@ pub struct FastransApp {
     /// Last known window position, persisted so drags are remembered.
     window_pos: Option<(f32, f32)>,
     autoupdate: bool,
+    /// NA business-casual polish of the English output (config `style`).
+    style_enabled: bool,
     ime_debug: bool,
 
     input: String,
@@ -98,6 +101,7 @@ impl FastransApp {
             pinyin_enabled: settings.pinyin,
             window_pos: settings.pos,
             autoupdate: settings.autoupdate,
+            style_enabled: settings.style,
             ime_debug: std::env::var_os("FASTRANS_IME_DEBUG").is_some(),
             input: String::new(),
             output: String::new(),
@@ -116,6 +120,7 @@ impl FastransApp {
         config::save(config::Settings {
             pinyin: self.pinyin_enabled,
             autoupdate: self.autoupdate,
+            style: self.style_enabled,
             pos: self.window_pos,
         });
     }
@@ -364,7 +369,13 @@ impl eframe::App for FastransApp {
             }
             if res.rev >= self.shown_rev {
                 self.shown_rev = res.rev;
-                self.output = res.text;
+                self.output = if self.style_enabled {
+                    style::polish(&res.text)
+                } else {
+                    res.text
+                };
+                // Restart the fade-in for the fresh translation.
+                ctx.animate_value_with_time(egui::Id::new("out_fade"), 0.0, 0.0);
             }
         }
         // A commit was requested while a translation was still in flight.
@@ -625,21 +636,46 @@ impl eframe::App for FastransApp {
             }
 
             ui.add_space(8.0);
-            let shown = if self.output.is_empty() && !self.input.is_empty() {
-                RichText::new("…").size(16.0).color(Color32::from_gray(110))
-            } else {
-                RichText::new(&self.output)
-                    .size(16.0)
-                    .color(Color32::from_rgb(140, 200, 255))
-            };
-            // Long translations wrap and scroll (mouse wheel) instead of
-            // overflowing the fixed-height bar.
-            egui::ScrollArea::vertical()
-                .max_height(ui.available_height())
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.label(shown);
+            let pending = self.dirty || self.shown_rev < self.rev;
+            if self.commit_pending {
+                // Enter was pressed while translating: spinner until it lands.
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(
+                        RichText::new("正在上屏…")
+                            .size(14.0)
+                            .color(Color32::from_gray(150)),
+                    );
                 });
+            } else if self.output.is_empty() && !self.input.is_empty() {
+                // First translation on its way: spinner + walking dots.
+                let dots = 1 + (ui.input(|i| i.time) * 3.0) as usize % 3;
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(13.0));
+                    ui.label(
+                        RichText::new("· ".repeat(dots))
+                            .size(16.0)
+                            .color(Color32::from_gray(120)),
+                    );
+                });
+            } else {
+                // Fresh translations fade in; while a newer one is being
+                // computed the current text dims slightly. Long output wraps
+                // and scrolls (mouse wheel) inside the fixed-height bar.
+                let fade = ctx.animate_value_with_time(egui::Id::new("out_fade"), 1.0, 0.18);
+                let color = if pending {
+                    Color32::from_rgb(105, 145, 185)
+                } else {
+                    Color32::from_rgb(140, 200, 255)
+                }
+                .gamma_multiply(0.35 + 0.65 * fade);
+                egui::ScrollArea::vertical()
+                    .max_height(ui.available_height().max(22.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&self.output).size(16.0).color(color));
+                    });
+            }
 
             let (enter, esc, quit, toggle_pinyin) = ui.input(|i| {
                 (
