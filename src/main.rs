@@ -29,11 +29,18 @@ fn main() -> eframe::Result<()> {
         // Silent background check; a newer exe is swapped in for next launch.
         fastrans::update::spawn_check();
     }
+    // Window/taskbar icon: raw 64x64 RGBA baked in at build time.
+    let icon = egui::IconData {
+        rgba: include_bytes!("../assets/icon-64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([560.0, 118.0])
         .with_decorations(false)
         .with_always_on_top()
         .with_resizable(false)
+        .with_icon(icon)
         .with_visible(false);
     // Reopen where the user last dragged the bar.
     if let Some((x, y)) = settings.pos {

@@ -1,6 +1,6 @@
 ﻿[package]
 name = "fastrans"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 authors = ["YSKM523"]
 license = "MIT"
@@ -19,6 +19,9 @@ flate2 = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [features]
 # oneDNN int8 backend: ~6x faster than ct2rs's default ruy on x86

@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon.png" width="96" alt="fastrans"></p>
+
 # fastrans
 
 打中文,上屏英文。一个完全离线的本地翻译输入条,单二进制,Rust 编写。
