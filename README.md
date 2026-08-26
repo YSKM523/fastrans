@@ -19,7 +19,11 @@
 
 ## 下载即用(Windows 10/11 x64)
 
-去 [**Releases**](https://github.com/YSKM523/fastrans/releases/latest) 下载:
+```powershell
+winget install YSKM523.fastrans
+```
+
+或去 [**Releases**](https://github.com/YSKM523/fastrans/releases/latest) 下载:
 
 - **`fastrans-vX.Y.Z-setup.exe`(推荐)**——双击安装,中文向导,免管理员权限,可选开机自启,系统应用列表里可卸载
 - **`fastrans-vX.Y.Z-windows-x64.zip`(绿色版)**——解压双击 `fastrans.exe` 即用
@@ -51,7 +55,8 @@ Linux 需 `cmake libxdo-dev libxkbcommon-dev`(X11 可用,Wayland 注入受限);m
 | `Enter` | 英文上屏到原应用 |
 | `Esc` | 收起 |
 | `Ctrl+P` | 内置拼音开关(持久化) |
-| `Ctrl+Q` | 退出 |
+| `Ctrl+,` | 设置页(开机自启、热键自定义、各开关;也可从托盘菜单进) |
+| `Ctrl+Q` | 退出(托盘菜单亦可) |
 
 拼音模式下:数字 `1-9` 选词,空格选第一个。音节歧义用撇号:`xi'an` 西安 / `xian` 先。
 

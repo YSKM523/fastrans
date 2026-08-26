@@ -34,8 +34,22 @@ pub struct FastransApp {
     job_tx: Sender<Job>,
     res_rx: Receiver<TransResult>,
     toggle: Arc<AtomicBool>,
-    // Keeps the OS hotkey registration alive for the app's lifetime.
-    _hotkey_manager: global_hotkey::GlobalHotKeyManager,
+    /// Tray "设置" clicked.
+    open_settings_flag: Arc<AtomicBool>,
+    /// Tray "退出" clicked.
+    quit_flag: Arc<AtomicBool>,
+    hotkey_manager: global_hotkey::GlobalHotKeyManager,
+    active_hotkey: global_hotkey::hotkey::HotKey,
+    hotkey_spec: String,
+    /// The user's explicit hotkey choice (persisted); None = auto fallback.
+    hotkey_custom: Option<String>,
+    // Settings page state.
+    settings_open: bool,
+    hotkey_edit: String,
+    hotkey_msg: String,
+    autostart_on: bool,
+    #[cfg(windows)]
+    _tray: Option<tray_icon::TrayIcon>,
     hint: String,
     pinyin: PinyinDict,
     pinyin_cache: Option<PinyinUi>,
@@ -74,21 +88,37 @@ pub struct FastransApp {
 }
 
 impl FastransApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_tx: Sender<Job>,
         res_rx: Receiver<TransResult>,
         toggle: Arc<AtomicBool>,
+        open_settings_flag: Arc<AtomicBool>,
+        quit_flag: Arc<AtomicBool>,
         hotkey_manager: global_hotkey::GlobalHotKeyManager,
+        active_hotkey: global_hotkey::hotkey::HotKey,
         hotkey_spec: String,
         pinyin: PinyinDict,
         settings: config::Settings,
+        #[cfg(windows)] tray: Option<tray_icon::TrayIcon>,
     ) -> Self {
         Self {
             job_tx,
             res_rx,
             toggle,
-            _hotkey_manager: hotkey_manager,
+            open_settings_flag,
+            quit_flag,
+            hotkey_manager,
+            active_hotkey,
+            hotkey_custom: settings.hotkey.clone(),
+            settings_open: false,
+            hotkey_edit: hotkey_spec.clone(),
+            hotkey_msg: String::new(),
+            autostart_on: crate::autostart::is_enabled(),
+            #[cfg(windows)]
+            _tray: tray,
             hint: format!("输入中文,回车上屏英文 · {hotkey_spec} · ^Q退出 ^P拼音"),
+            hotkey_spec,
             pinyin,
             pinyin_cache: None,
             user: UserDict::load(),
@@ -114,10 +144,11 @@ impl FastransApp {
     }
 
     fn save_settings(&self) {
-        config::save(config::Settings {
+        config::save(&config::Settings {
             pinyin: self.pinyin_enabled,
             autoupdate: self.autoupdate,
             style: self.style_enabled,
+            hotkey: self.hotkey_custom.clone(),
             pos: self.window_pos,
         });
     }
@@ -139,6 +170,10 @@ impl FastransApp {
             self.capture_pos(ctx);
             self.save_settings();
             self.user.save_if_dirty();
+            if self.settings_open {
+                self.settings_open = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(560.0, 118.0)));
+            }
             self.last_word = None;
             self.page = 0;
             self.input.clear();
@@ -293,6 +328,155 @@ impl FastransApp {
         self.last_edit = Instant::now();
     }
 
+    fn open_settings(&mut self, ctx: &egui::Context) {
+        self.settings_open = true;
+        self.hotkey_edit = self.hotkey_spec.clone();
+        self.hotkey_msg.clear();
+        self.autostart_on = crate::autostart::is_enabled();
+        self.visible = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(560.0, 330.0)));
+    }
+
+    fn close_settings(&mut self, ctx: &egui::Context) {
+        self.settings_open = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(560.0, 118.0)));
+        self.focus_next = true;
+    }
+
+    /// Re-registers the global hotkey from the settings text field. The new
+    /// combo is registered before the old one is dropped, so a bad input
+    /// never leaves the app without a hotkey.
+    fn apply_hotkey(&mut self) {
+        let spec = self.hotkey_edit.trim().to_ascii_lowercase();
+        if spec == self.hotkey_spec {
+            self.hotkey_msg = "热键未变化".into();
+            return;
+        }
+        match crate::hotkey::parse(&spec) {
+            Ok(hk) => match self.hotkey_manager.register(hk) {
+                Ok(()) => {
+                    let _ = self.hotkey_manager.unregister(self.active_hotkey);
+                    self.active_hotkey = hk;
+                    self.hotkey_spec = spec.clone();
+                    self.hotkey_custom = Some(spec.clone());
+                    self.hint = format!("输入中文,回车上屏英文 · {spec} · ^Q退出 ^P拼音");
+                    self.save_settings();
+                    self.hotkey_msg = format!("已生效:{spec}");
+                }
+                Err(e) => self.hotkey_msg = format!("注册失败(可能已被其他程序占用):{e}"),
+            },
+            Err(e) => self.hotkey_msg = format!("无法解析:{e:#}"),
+        }
+    }
+
+    fn render_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut do_close = false;
+        let mut do_quit = false;
+        let mut do_apply = false;
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("设置")
+                    .size(19.0)
+                    .strong()
+                    .color(Color32::from_gray(230)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("完成").clicked() {
+                    do_close = true;
+                }
+            });
+        });
+        ui.add_space(10.0);
+
+        if ui.checkbox(&mut self.autostart_on, "开机自启动").changed() {
+            if !crate::autostart::set(self.autostart_on) {
+                self.autostart_on = !self.autostart_on;
+                self.hotkey_msg = "自启动设置写入失败".into();
+            }
+        }
+        if ui
+            .checkbox(&mut self.pinyin_enabled, "内置拼音输入(无系统输入法时的兜底)")
+            .changed()
+        {
+            self.pinyin_cache = None;
+            self.sugg_cache = None;
+            self.last_word = None;
+            self.page = 0;
+            changed = true;
+        }
+        if ui
+            .checkbox(&mut self.style_enabled, "译文口吻润色(北美办公室腔)")
+            .changed()
+        {
+            changed = true;
+        }
+        if ui
+            .checkbox(&mut self.autoupdate, "启动时静默自动更新")
+            .changed()
+        {
+            changed = true;
+        }
+        ui.add_space(10.0);
+
+        ui.horizontal(|ui| {
+            ui.label("呼出热键");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.hotkey_edit)
+                    .desired_width(220.0)
+                    .hint_text("如 ctrl+alt+t"),
+            );
+            if ui.button("应用").clicked() {
+                do_apply = true;
+            }
+        });
+        if !self.hotkey_msg.is_empty() {
+            ui.label(
+                RichText::new(&self.hotkey_msg)
+                    .size(13.0)
+                    .color(Color32::from_gray(150)),
+            );
+        }
+        ui.add_space(12.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("退出 fastrans").clicked() {
+                do_quit = true;
+            }
+            ui.label(
+                RichText::new(concat!(
+                    "v",
+                    env!("CARGO_PKG_VERSION"),
+                    " · 设置即时生效并保存"
+                ))
+                .size(12.0)
+                .color(Color32::from_gray(120)),
+            );
+        });
+
+        if ui.input(|i| i.key_pressed(Key::Escape)) {
+            do_close = true;
+        }
+        if changed {
+            self.save_settings();
+        }
+        if do_apply {
+            self.apply_hotkey();
+        }
+        if do_quit {
+            self.capture_pos(ctx);
+            self.save_settings();
+            self.user.save_if_dirty();
+            std::process::exit(0);
+        }
+        if do_close {
+            self.close_settings(ctx);
+        }
+    }
+
     /// Moves the TextEdit caret to the end after the buffer was rewritten
     /// behind the widget's back (candidate/suggestion insertion).
     fn caret_to_end(&self, ctx: &egui::Context) {
@@ -375,6 +559,16 @@ impl eframe::App for FastransApp {
                     }
                 }
             });
+        }
+        // Tray commands.
+        if self.quit_flag.swap(false, Ordering::SeqCst) {
+            self.capture_pos(ctx);
+            self.save_settings();
+            self.user.save_if_dirty();
+            std::process::exit(0);
+        }
+        if self.open_settings_flag.swap(false, Ordering::SeqCst) {
+            self.open_settings(ctx);
         }
         // Global hotkey toggles the bar.
         if self.toggle.swap(false, Ordering::SeqCst) {
@@ -459,6 +653,12 @@ impl eframe::App for FastransApp {
                 }
             } else if drag_zone.hovered() {
                 ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            }
+
+            // Settings page replaces the bar content while open.
+            if self.settings_open {
+                self.render_settings(ui, &ctx);
+                return;
             }
 
             // Intercept IME keys BEFORE the TextEdit consumes them, so the
@@ -712,14 +912,19 @@ impl eframe::App for FastransApp {
                     });
             }
 
-            let (enter, esc, quit, toggle_pinyin) = ui.input(|i| {
+            let (enter, esc, quit, toggle_pinyin, open_set) = ui.input(|i| {
                 (
                     i.key_pressed(Key::Enter),
                     i.key_pressed(Key::Escape),
                     i.modifiers.ctrl && i.key_pressed(Key::Q),
                     i.modifiers.ctrl && i.key_pressed(Key::P),
+                    i.modifiers.ctrl && i.key_pressed(Key::Comma),
                 )
             });
+            if open_set {
+                self.open_settings(&ctx);
+                return;
+            }
             if quit {
                 // Ctrl+Q: quit for real. ViewportCommand::Close hangs in some
                 // component's drop (observed: window gone, process stuck), and

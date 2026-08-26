@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Settings {
     /// Built-in pinyin fallback on/off (Ctrl+P).
     pub pinyin: bool,
@@ -11,6 +11,8 @@ pub struct Settings {
     pub autoupdate: bool,
     /// North-American business-casual polish of the English output.
     pub style: bool,
+    /// User-chosen hotkey spec (settings page); falls back to env/defaults.
+    pub hotkey: Option<String>,
     /// Last bar position in logical points (drag to move, remembered).
     pub pos: Option<(f32, f32)>,
 }
@@ -21,6 +23,7 @@ impl Default for Settings {
             pinyin: true,
             autoupdate: true,
             style: true,
+            hotkey: None,
             pos: None,
         }
     }
@@ -41,6 +44,12 @@ pub fn load() -> Settings {
             Some(("pinyin", v)) => s.pinyin = v.trim() != "0",
             Some(("autoupdate", v)) => s.autoupdate = v.trim() != "0",
             Some(("style", v)) => s.style = v.trim() != "0",
+            Some(("hotkey", v)) => {
+                let v = v.trim();
+                if !v.is_empty() {
+                    s.hotkey = Some(v.to_string());
+                }
+            }
             Some(("pos", v)) => {
                 if let Some((x, y)) = v.split_once(',') {
                     if let (Ok(x), Ok(y)) = (x.trim().parse(), y.trim().parse()) {
@@ -54,7 +63,7 @@ pub fn load() -> Settings {
     s
 }
 
-pub fn save(s: Settings) {
+pub fn save(s: &Settings) {
     let Some(p) = path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -65,6 +74,9 @@ pub fn save(s: Settings) {
         if s.autoupdate { 1 } else { 0 },
         if s.style { 1 } else { 0 }
     );
+    if let Some(hk) = &s.hotkey {
+        out.push_str(&format!("hotkey={hk}\n"));
+    }
     if let Some((x, y)) = s.pos {
         out.push_str(&format!("pos={x:.0},{y:.0}\n"));
     }

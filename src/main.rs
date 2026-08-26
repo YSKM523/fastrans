@@ -57,11 +57,14 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             install_cjk_font(&cc.egui_ctx);
 
-            // Preferred hotkey from FASTRANS_HOTKEY, else the fallback chain
-            // (the default Ctrl+Alt+Space may be taken by another app).
+            // Preferred hotkey: settings page choice, then FASTRANS_HOTKEY,
+            // then the fallback chain (Ctrl+Alt+Space may be taken).
             let manager = GlobalHotKeyManager::new().expect("hotkey manager");
-            let prefer = std::env::var("FASTRANS_HOTKEY").ok();
-            let (_hotkey, hotkey_spec) = hotkey::register(&manager, prefer.as_deref())
+            let prefer = settings
+                .hotkey
+                .clone()
+                .or_else(|| std::env::var("FASTRANS_HOTKEY").ok());
+            let (active_hotkey, hotkey_spec) = hotkey::register(&manager, prefer.as_deref())
                 .unwrap_or_else(|e| {
                     eprintln!("{e:#}");
                     std::process::exit(1);
@@ -81,6 +84,66 @@ fn main() -> eframe::Result<()> {
                 }
             });
 
+            // System tray: toggle bar / settings / quit. Menu and icon-click
+            // events arrive on crossbeam channels; forwarding threads set
+            // flags and wake the UI, same pattern as the global hotkey.
+            let open_settings = Arc::new(AtomicBool::new(false));
+            let quit = Arc::new(AtomicBool::new(false));
+            #[cfg(windows)]
+            let _tray = {
+                use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+                use tray_icon::{TrayIconBuilder, TrayIconEvent};
+                let mi_toggle = MenuItem::new("显示 / 隐藏翻译条", true, None);
+                let mi_settings = MenuItem::new("设置…", true, None);
+                let mi_quit = MenuItem::new("退出", true, None);
+                let menu = Menu::new();
+                let _ = menu.append_items(&[
+                    &mi_toggle,
+                    &mi_settings,
+                    &PredefinedMenuItem::separator(),
+                    &mi_quit,
+                ]);
+                let icon_rgba = include_bytes!("../assets/icon-64.rgba").to_vec();
+                let tray_icon = tray_icon::Icon::from_rgba(icon_rgba, 64, 64).ok();
+                let mut builder = TrayIconBuilder::new()
+                    .with_menu(Box::new(menu))
+                    .with_tooltip(concat!("fastrans v", env!("CARGO_PKG_VERSION")));
+                if let Some(i) = tray_icon {
+                    builder = builder.with_icon(i);
+                }
+                let tray = builder.build().ok();
+
+                let (id_toggle, id_settings, id_quit) =
+                    (mi_toggle.id().clone(), mi_settings.id().clone(), mi_quit.id().clone());
+                let (t2, s2, q2) = (toggle.clone(), open_settings.clone(), quit.clone());
+                let ctx = cc.egui_ctx.clone();
+                thread::spawn(move || {
+                    let rx = MenuEvent::receiver();
+                    while let Ok(ev) = rx.recv() {
+                        if ev.id == id_toggle {
+                            t2.store(true, Ordering::SeqCst);
+                        } else if ev.id == id_settings {
+                            s2.store(true, Ordering::SeqCst);
+                        } else if ev.id == id_quit {
+                            q2.store(true, Ordering::SeqCst);
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+                let t3 = toggle.clone();
+                let ctx = cc.egui_ctx.clone();
+                thread::spawn(move || {
+                    let rx = TrayIconEvent::receiver();
+                    while let Ok(ev) = rx.recv() {
+                        if let TrayIconEvent::DoubleClick { .. } = ev {
+                            t3.store(true, Ordering::SeqCst);
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+                tray
+            };
+
             let ctx = cc.egui_ctx.clone();
             let (job_tx, res_rx) = engine::spawn_worker(model_dir, move || ctx.request_repaint());
             let pinyin = dict_thread.join().expect("pinyin dict load");
@@ -89,10 +152,15 @@ fn main() -> eframe::Result<()> {
                 job_tx,
                 res_rx,
                 toggle,
+                open_settings,
+                quit,
                 manager,
+                active_hotkey,
                 hotkey_spec,
                 pinyin,
                 settings,
+                #[cfg(windows)]
+                _tray,
             )))
         }),
     )
