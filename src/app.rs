@@ -88,10 +88,7 @@ impl FastransApp {
             res_rx,
             toggle,
             _hotkey_manager: hotkey_manager,
-            hint: format!(
-                "输入中文,回车上屏英文 · {hotkey_spec} · ^Q退出 ^P拼音 · v{}",
-                env!("CARGO_PKG_VERSION")
-            ),
+            hint: format!("输入中文,回车上屏英文 · {hotkey_spec} · ^Q退出 ^P拼音"),
             pinyin,
             pinyin_cache: None,
             user: UserDict::load(),
@@ -260,8 +257,12 @@ impl FastransApp {
         let Some(cand) = cand else { return };
         // Remember the pick (unless it still contains raw letters): the same
         // pinyin ranks it first next time, and the previous word links to it
-        // for follow-up suggestions.
-        if !cand.text.bytes().any(|b| b.is_ascii_alphanumeric()) {
+        // for follow-up suggestions. Committing the whole-line conversion
+        // memorizes each word on its path instead of the sentence blob.
+        if cand.sentence {
+            let path = self.analysis_for(&run).path.clone();
+            self.record_path(&run, &path);
+        } else if !cand.text.bytes().any(|b| b.is_ascii_alphanumeric()) {
             self.user.record_pick(
                 &run[..cand.consumed_bytes].to_ascii_lowercase(),
                 &cand.text,
@@ -305,16 +306,38 @@ impl FastransApp {
         }
     }
 
-    /// Converts any trailing pinyin in place (used on Enter).
+    /// Converts any trailing pinyin in place (used on Enter), and memorizes
+    /// the conversion path — the IME learns from natural typing, not just
+    /// explicit candidate picks.
     fn finalize_pinyin(&mut self) -> bool {
         let (start, run) = self.pinyin_run();
         if run.is_empty() {
             return false;
         }
         let run = run.to_string();
-        let best = self.analysis_for(&run).best_line.clone();
+        let a = self.analysis_for(&run);
+        let (best, path) = (a.best_line.clone(), a.path.clone());
+        self.record_path(&run, &path);
         self.input = format!("{}{}", &self.input[..start], best);
         true
+    }
+
+    /// Records every (pinyin span, word) pair of a committed conversion path,
+    /// chaining follow bigrams along the way.
+    fn record_path(&mut self, run: &str, path: &[(String, usize, usize)]) {
+        let mut prev = self.last_word.clone();
+        for (word, s, e) in path {
+            if word.bytes().any(|b| b.is_ascii_alphanumeric()) {
+                prev = None;
+                continue;
+            }
+            self.user
+                .record_pick(&run[*s..*e].to_ascii_lowercase(), word, prev.as_deref());
+            prev = Some(word.clone());
+        }
+        if prev.is_some() {
+            self.last_word = prev;
+        }
     }
 
     fn commit(&mut self, ctx: &egui::Context) {
@@ -408,6 +431,15 @@ impl eframe::App for FastransApp {
         bar.show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_height(ui.available_height());
+
+            // Version tag, painted in the bottom-right corner (layout-free).
+            ui.painter().text(
+                ui.max_rect().right_bottom() + egui::vec2(-2.0, -1.0),
+                egui::Align2::RIGHT_BOTTOM,
+                concat!("v", env!("CARGO_PKG_VERSION")),
+                egui::FontId::proportional(10.0),
+                Color32::from_gray(95),
+            );
 
             // Registered before the widgets, so it sits underneath them:
             // dragging empty bar space moves the window (native OS drag),
@@ -535,7 +567,10 @@ impl eframe::App for FastransApp {
 
             let edit = egui::TextEdit::singleline(&mut self.input)
                 .id(egui::Id::new("bar_input"))
-                .hint_text(self.hint.as_str())
+                .hint_text(
+                    RichText::new(self.hint.as_str())
+                        .font(egui::FontId::proportional(19.0)),
+                )
                 .font(egui::FontId::proportional(19.0))
                 .desired_width(f32::INFINITY)
                 .frame(Frame::new());

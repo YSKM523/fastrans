@@ -88,6 +88,9 @@ fn pack_initials(letters: &[u8]) -> Option<u64> {
 pub struct Candidate {
     pub text: String,
     pub consumed_bytes: usize,
+    /// True for the whole-line conversion candidate: committing it should
+    /// memorize its per-word path, not the blob.
+    pub sentence: bool,
 }
 
 /// The result of analyzing a pinyin run.
@@ -97,6 +100,10 @@ pub struct Analysis {
     /// Whole-run conversion: best path over convertible prefix + leftover
     /// letters.
     pub best_line: String,
+    /// The best path's dictionary words with their pinyin byte spans in the
+    /// run — committing the conversion records each (pinyin, word) pair, so
+    /// the IME learns from natural typing, not just explicit digit picks.
+    pub path: Vec<(String, usize, usize)>,
 }
 
 fn pack(key: u128, syl_id: u16) -> u128 {
@@ -239,6 +246,7 @@ impl PinyinDict {
             return Analysis {
                 candidates: Vec::new(),
                 best_line: run.to_string(),
+                path: Vec::new(),
             };
         }
         let lower = run.to_ascii_lowercase();
@@ -358,6 +366,7 @@ impl PinyinDict {
         // Furthest reachable position; the rest is the partial tail.
         let full_end = (0..=n).rev().find(|&i| dp[i].is_some()).unwrap_or(0);
         let mut parts: Vec<&str> = Vec::new();
+        let mut path: Vec<(String, usize, usize)> = Vec::new();
         let mut has_raw = false;
         let mut i = full_end;
         while i > 0 {
@@ -367,11 +376,17 @@ impl PinyinDict {
                     parts.push(&lower[a..b]);
                     has_raw = true;
                 }
-                None => parts.push(s.word),
+                None => {
+                    parts.push(s.word);
+                    if !s.word.is_empty() {
+                        path.push((s.word.to_string(), s.prev, i));
+                    }
+                }
             }
             i = s.prev;
         }
         parts.reverse();
+        path.reverse();
         let mut best_line: String = parts.concat();
         best_line.push_str(lower[full_end..].trim_start_matches('\''));
 
@@ -382,7 +397,7 @@ impl PinyinDict {
         // otherwise space commits a partial word and re-recording it
         // entrenches the wrong default. The UI pages these 5 at a time.
         let mut candidates: Vec<Candidate> = Vec::new();
-        let mut push = |cands: &mut Vec<Candidate>, text: &str, consumed: usize| {
+        let mut push = |cands: &mut Vec<Candidate>, text: &str, consumed: usize, sentence: bool| {
             if !cands
                 .iter()
                 .any(|c| c.text == text && c.consumed_bytes == consumed)
@@ -390,21 +405,22 @@ impl PinyinDict {
                 cands.push(Candidate {
                     text: text.to_string(),
                     consumed_bytes: consumed,
+                    sentence,
                 });
             }
         };
         let remembered = user.prefix_matches(&lower);
         for (consumed, w, _) in remembered.iter().filter(|(c, _, _)| *c >= full_end) {
-            push(&mut candidates, w, *consumed);
+            push(&mut candidates, w, *consumed, false);
         }
         // Skip the whole-line candidate when it contains raw letters — a
         // half-converted string is not something to commit or memorize.
         if full_end > 0 && !has_raw {
             let text = parts.concat();
-            push(&mut candidates, &text, full_end);
+            push(&mut candidates, &text, full_end, true);
         }
         for (consumed, w, _) in remembered.iter().filter(|(c, _, _)| *c < full_end) {
-            push(&mut candidates, w, *consumed);
+            push(&mut candidates, w, *consumed, false);
         }
         let mut starts: Vec<(usize, u128, f64)> = Vec::new();
         self.walk_words(bytes, 0, |end, key| {
@@ -427,6 +443,7 @@ impl PinyinDict {
                 candidates.push(Candidate {
                     text: w.to_string(),
                     consumed_bytes: end,
+                    sentence: false,
                 });
                 if candidates.len() >= MAX_CANDIDATES {
                     break 'outer;
@@ -451,6 +468,7 @@ impl PinyinDict {
                         jianpin.push(Candidate {
                             text: w.to_string(),
                             consumed_bytes: lower.len(),
+                            sentence: false,
                         });
                     }
                 }
@@ -471,6 +489,7 @@ impl PinyinDict {
         Analysis {
             candidates,
             best_line,
+            path,
         }
     }
 
@@ -562,6 +581,10 @@ mod tests {
         // Whole-sentence jianpin: every letter is an initial.
         let a = dict.analyze("wmdl", &user);
         assert_eq!(a.best_line, "我们到了", "wmdl -> {}", a.best_line);
+        // The conversion path exposes (word, pinyin-span) pairs for learning.
+        let path: Vec<(&str, usize, usize)> =
+            a.path.iter().map(|(w, s, e)| (w.as_str(), *s, *e)).collect();
+        assert_eq!(path, vec![("我们", 0, 2), ("到了", 2, 4)]);
         // Jianpin mixed with full pinyin.
         let a = dict.analyze("wbuxiangquchifan", &user);
         assert_eq!(a.best_line, "我不想去吃饭", "got {}", a.best_line);
